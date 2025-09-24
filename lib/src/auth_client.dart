@@ -5,6 +5,7 @@ import 'http_client.dart';
 import 'config.dart';
 import 'models.dart';
 import 'storage.dart';
+import '../util/logger.dart';
 
 class AuthClient {
   final AuthConfig config;
@@ -46,7 +47,9 @@ class AuthClient {
       body: jsonEncode({'refresh_token': rt}),
     );
     if (res.statusCode == 200) {
-      final t = Tokens.fromJson(jsonDecode(res.body));
+      final body = jsonDecode(res.body);
+      AppLogger.info('Login response: $body');
+      final t = Tokens.fromJson(body);
       await storage.writeAccess(t.accessToken);
       return true;
     }

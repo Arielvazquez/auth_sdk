@@ -1,26 +1,36 @@
-// lib/src/models.dart
 class Tokens {
   final String accessToken;
-  final String? refreshToken;
-  final int? expiresIn;
+  final String refreshToken;
+  final String tokenType;
+  final int expiresIn;
 
-  Tokens({required this.accessToken, this.refreshToken, this.expiresIn});
+  Tokens({
+    required this.accessToken,
+    required this.refreshToken,
+    required this.tokenType,
+    required this.expiresIn,
+  });
 
-  factory Tokens.fromJson(Map<String,dynamic> j) => Tokens(
-    accessToken: j['access_token'],
-    refreshToken: j['refresh_token'],
-    expiresIn: j['expires_in'],
-  );
-}
+  factory Tokens.fromJson(Map<String, dynamic> j) {
+    // aceptar snake/camel y tipos mixtos
+    String? s(dynamic v) => (v == null) ? null : v.toString();
+    int toInt(dynamic v) =>
+        v is int ? v : int.tryParse(s(v) ?? '') ?? 0;
 
-class User {
-  final int id;
-  final String email;
-  final String? name;
-  final String? role;
+    final at = s(j['access_token'] ?? j['accessToken']);
+    final rt = s(j['refresh_token'] ?? j['refreshToken']);
+    final tt = s(j['token_type'] ?? j['tokenType']);
+    final ei = j['expires_in'] ?? j['expiresIn'];
 
-  User({required this.id, required this.email, this.name, this.role});
+    if (at == null || tt == null) {
+      throw FormatException('Missing token fields: access_token/token_type');
+    }
 
-  factory User.fromJson(Map<String,dynamic> j) =>
-      User(id: j['id'], email: j['email'], name: j['name'], role: j['role']);
+    return Tokens(
+      accessToken: at,
+      refreshToken: rt ?? '',     // opcional si tu backend no lo envía
+      tokenType: tt,
+      expiresIn: toInt(ei),
+    );
+  }
 }
