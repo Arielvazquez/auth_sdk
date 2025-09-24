@@ -1,5 +1,6 @@
 // lib/src/auth_client.dart
 import 'dart:convert';
+import 'package:auth_sdk/src/http_client.dart';
 import 'package:http/http.dart' as http;
 import 'config.dart';
 import 'models.dart';
