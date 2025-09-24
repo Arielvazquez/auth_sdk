@@ -1,6 +1,5 @@
 // lib/src/auth_client.dart
 import 'dart:convert';
-import 'package:auth_sdk/src/http_client.dart';
 import 'package:http/http.dart' as http;
 import 'config.dart';
 import 'models.dart';
@@ -81,16 +80,40 @@ class AuthClient {
 
   Future<Map<String,dynamic>> me() async {
     // aseguro sesión
-    if (!await ensureSession()) throw Exception('No session');
-    final client = AuthHttpClient(http.Client(), storage, () async {
-      final ok = await _refresh();
-      return ok ? await storage.readAccess() : null;
-    }, config);
+    if (!await ensureSession()) 
+      throw Exception('No session');
 
-    final r = await client.get(config.endpoint('me'));
-    if (r.statusCode != 200) throw Exception(_err(r));
-    return jsonDecode(r.body);
+    Future<http.Response> _call(String token) {
+      return _plain.get(
+        config.endpoint('me'),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Accept': 'application/json',
+        },
+      );
+    }
+
+    var jwt = await storage.readAccess();
+    if (jwt == null) throw Exception('No token');
+
+    // Primer intento
+    var r = await _call(jwt);
+
+    // Si 401, intenta refrescar y reintenta una vez
+    if (r.statusCode == 401) {
+      final ok = await _refresh();
+      if (!ok) throw Exception('Unauthorized');
+      jwt = await storage.readAccess();
+      if (jwt == null) throw Exception('No token after refresh');
+      r = await _call(jwt);
+    }
+
+    if (r.statusCode != 200) {
+      throw Exception(_err(r));
+    }
+    return jsonDecode(r.body) as Map<String, dynamic>;
   }
+  
 
   Future<void> logout() async {
     final rt = await storage.readRefresh();
