@@ -1,6 +1,7 @@
 // lib/src/auth_client.dart
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'http_client.dart';
 import 'config.dart';
 import 'models.dart';
 import 'storage.dart';
@@ -80,6 +81,21 @@ class AuthClient {
 
   Future<Map<String,dynamic>> me() async {
     // aseguro sesión
+    if (!await ensureSession()) throw Exception('No session');
+    final client = AuthHttpClient(http.Client(), storage, () async {
+      final ok = await _refresh();
+      return ok ? await storage.readAccess() : null;
+    }, config);
+
+    final r = await client.get(config.endpoint('me'));
+    if (r.statusCode != 200) throw Exception(_err(r));
+    return jsonDecode(r.body);
+
+  }
+
+/*
+  Future<Map<String,dynamic>> me() async {
+    // aseguro sesión
     if (!await ensureSession()) 
       throw Exception('No session');
 
@@ -114,7 +130,7 @@ class AuthClient {
     return jsonDecode(r.body) as Map<String, dynamic>;
   }
   
-
+*/
   Future<void> logout() async {
     final rt = await storage.readRefresh();
     if (rt != null) {
