@@ -5,8 +5,8 @@ class GoogleSignInAdapter {
   Future<String> signInAndGetIdToken({String? iosClientId, String? webClientId}) async {
     // v7: singleton + initialize opcional
     await GoogleSignIn.instance.initialize(
-      // clientId: iosClientId,      // si hace falta
-      // serverClientId: webClientId // si hace falta
+      clientId: iosClientId,      // si hace falta
+      serverClientId: webClientId // si hace falta
     );
     final acc = await GoogleSignIn.instance.authenticate();
     final auth = await acc.authentication;
