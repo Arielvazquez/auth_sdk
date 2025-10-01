@@ -1,36 +1,62 @@
 class Tokens {
   final String accessToken;
   final String refreshToken;
-  final String tokenType;
-  final int expiresIn;
+  final String tokenType; // "Bearer"
+  final int expiresIn; // segundos
+  final DateTime? refreshExpiresAt; // ISO-8601 opcional
 
   Tokens({
     required this.accessToken,
     required this.refreshToken,
     required this.tokenType,
     required this.expiresIn,
+    this.refreshExpiresAt,
   });
 
-  factory Tokens.fromJson(Map<String, dynamic> j) {
-    // aceptar snake/camel y tipos mixtos
-    String? s(dynamic v) => (v == null) ? null : v.toString();
-    int toInt(dynamic v) =>
-        v is int ? v : int.tryParse(s(v) ?? '') ?? 0;
-
-    final at = s(j['access_token'] ?? j['accessToken']);
-    final rt = s(j['refresh_token'] ?? j['refreshToken']);
-    final tt = s(j['token_type'] ?? j['tokenType']);
-    final ei = j['expires_in'] ?? j['expiresIn'];
-
-    if (at == null || tt == null) {
-      throw FormatException('Missing token fields: access_token/token_type');
-    }
-
+  factory Tokens.fromJson(Map<String, dynamic> json) {
     return Tokens(
-      accessToken: at,
-      refreshToken: rt ?? '',     // opcional si tu backend no lo envía
-      tokenType: tt,
-      expiresIn: toInt(ei),
+      accessToken: json['access_token'] as String,
+      refreshToken: json['refresh_token'] as String,
+      tokenType: json['token_type'] as String,
+      expiresIn: (json['expires_in'] as num).toInt(),
+      refreshExpiresAt: json['refresh_expires_at'] == null
+          ? null
+          : DateTime.parse(json['refresh_expires_at'] as String),
     );
   }
+
+  Map<String, dynamic> toJson() => {
+        'access_token': accessToken,
+        'refresh_token': refreshToken,
+        'token_type': tokenType,
+        'expires_in': expiresIn,
+        if (refreshExpiresAt != null)
+          'refresh_expires_at': refreshExpiresAt!.toIso8601String(),
+      };
+}
+
+class TokensPartial {
+  final String accessToken;
+  final String tokenType; // "Bearer"
+  final int expiresIn; // segundos
+
+  TokensPartial({
+    required this.accessToken,
+    required this.tokenType,
+    required this.expiresIn,
+  });
+
+  factory TokensPartial.fromJson(Map<String, dynamic> json) {
+    return TokensPartial(
+      accessToken: json['access_token'] as String,
+      tokenType: json['token_type'] as String,
+      expiresIn: (json['expires_in'] as num).toInt(),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'access_token': accessToken,
+        'token_type': tokenType,
+        'expires_in': expiresIn,
+      };
 }
