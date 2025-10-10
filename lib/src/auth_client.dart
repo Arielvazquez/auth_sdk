@@ -80,6 +80,9 @@ class AuthClient {
   final TokenStorage storage;
   final _AuthHttp _plain = _AuthHttp(http.Client());
 
+  Completer<bool>? _refreshing;
+  
+
 
   AuthClient({required this.config, required this.storage});
 
@@ -135,29 +138,35 @@ class AuthClient {
 
   // -------- Refresh token flow (/token → TokensPartial) --------
   Future<bool> _refresh() async {
-    final rt = await storage.readRefresh();
-    if (rt == null) return false;
+    if (_refreshing != null) return _refreshing!.future; // ya hay uno en curso
+    _refreshing = Completer<bool>();
+    try {
+      final rt = await storage.readRefresh();
+      if (rt == null || rt.isEmpty) { _refreshing!.complete(false); return false; }
 
-    final r = await _plain.postJson(config.endpoint('token'), {
-      'refresh_token': rt,
-    });
+      final r = await _plain.postJson(config.endpoint('token'), {
+        'refresh_token': rt,
+      });
 
-    if (r.statusCode == 200) {
-      AppLogger.info('Refresh OK');
-      final body = jsonDecode(r.body) as Map<String, dynamic>;
-      final t = TokensPartial.fromJson(body); // access_token + expires_in
-      await storage.writeAccess(t.accessToken);
-      // El refresh token NO cambia en /token (según OpenAPI), no lo tocamos.
-      return true;
-    }
-
-    // Si falla, limpiamos el access (no el refresh, por si el caller quiere intentar logout)
-    await storage.writeAccess('');
-    // Propagamos error específico
-    _throwFor(r);
+      if (r.statusCode == 200) {
+        AppLogger.info('Refresh OK');
+        final body = jsonDecode(r.body) as Map<String, dynamic>;
+        final t = TokensPartial.fromJson(body); // access_token + expires_in
+        await storage.writeAccess(t.accessToken);
+        _refreshing!.complete(true);
+        return true;
+      }
+      // Si falla, limpiamos el access (no el refresh, por si el caller quiere intentar logout)
+      await storage.writeAccess('');
+      // Propagamos error específico
+      _throwFor(r);
+    } finally {
+      _refreshing = null;
+    }  
   }
 
   // -------- Sesión --------
+  /*
   Future<bool> ensureSession() async {
     final jwt = await storage.readAccess();
     if (jwt != null && jwt.isNotEmpty && !(await _isExpired(jwt, leeway: config.accessLeeway))) {
@@ -165,6 +174,41 @@ class AuthClient {
     }
     return await _refresh();
   }
+  */
+  /// Devuelve true si hay sesión utilizable (access válido),
+  /// intenta refresh si expiró o está por expirar.
+  /// No lanza si el refresh falla de forma proactiva (y el token sigue vigente).
+  Future<bool> ensureSession({Duration proactiveLeeway = const Duration(seconds: 90)}) async {
+    final jwt = await storage.readAccess();
+
+    // Sin access guardado → intentar refresh con RT.
+    if (jwt == null || jwt.isEmpty) {
+      return await _refresh();
+    }
+
+    // ¿Ya expiró según leeway base? → intentar refresh obligatorio.
+    final expired = await _isExpired(jwt, leeway: config.accessLeeway);
+    if (expired) {
+      return await _refresh();
+    }
+
+    // ¿Está por expirar pronto? → intentar refresh proactivo.
+    final willExpireSoon = await _isExpired(
+      jwt,
+      leeway: config.accessLeeway + proactiveLeeway,
+    );
+
+    if (willExpireSoon) {
+      final ok = await _refresh();
+      // Si el refresh proactivo falla pero el token aún sirve, seguimos.
+      if (!ok) return true;
+      return true;
+    }
+
+    // Access todavía válido y no cerca de expirar.
+    return true;
+  }
+
 
   // -------- Cliente autenticado con retry 401 --------
   Future<http.Response> _authedGet(Uri url) async {
