@@ -3,7 +3,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
-//import 'http_client.dart';
 import 'config.dart';
 import 'models.dart';
 import 'storage.dart';
@@ -44,6 +43,8 @@ class _AuthHttp {
   final Duration timeout;
   _AuthHttp(this._client, {this.timeout = const Duration(seconds: 20)});
 
+  void close() => _client.close();
+
   Future<http.Response> postJson(Uri url, Map<String, dynamic> body, {Map<String, String>? headers}) async {
     try {
       return await _client
@@ -78,13 +79,20 @@ class _AuthHttp {
 class AuthClient {
   final AuthConfig config;
   final TokenStorage storage;
-  final _AuthHttp _plain = _AuthHttp(http.Client());
+  final _AuthHttp _plain;
 
-  Completer<bool>? _refreshing;
-  
+  /// Refresh en curso: todas las llamadas que llegan mientras tanto esperan
+  /// este mismo resultado (o el mismo error).
+  Future<bool>? _refreshing;
 
+  /// [httpClient]: opcional, para tests. Se usa un solo cliente para todos
+  /// los pedidos (antes se creaba uno nuevo en cada pedido autenticado y
+  /// nunca se cerraba).
+  AuthClient({required this.config, required this.storage, http.Client? httpClient})
+      : _plain = _AuthHttp(httpClient ?? http.Client());
 
-  AuthClient({required this.config, required this.storage});
+  /// Cierra el cliente HTTP. Después de esto el AuthClient no se puede usar.
+  void close() => _plain.close();
 
   // -------- Helpers JWT --------
   Map<String, dynamic> _decodePayload(String jwt) {
@@ -96,7 +104,7 @@ class AuthClient {
   Future<bool> _isExpired(String jwt, {Duration leeway = const Duration(seconds: 15)}) async {
     try {
       final payload = _decodePayload(jwt);
-      final exp = payload['exp'] as int?;
+      final exp = (payload['exp'] as num?)?.toInt();
       if (exp == null) return true;
       final expDt = DateTime.fromMillisecondsSinceEpoch(exp * 1000).subtract(leeway);
       return DateTime.now().isAfter(expDt);
@@ -137,47 +145,75 @@ class AuthClient {
   }
 
   // -------- Refresh token flow (/token → TokensPartial) --------
-  Future<bool> _refresh() async {
-    if (_refreshing != null) return _refreshing!.future; // ya hay uno en curso
-    _refreshing = Completer<bool>();
+  /// Renueva el access token con el refresh token.
+  /// - `false`: no hay refresh token guardado.
+  /// - `true`: renovado.
+  /// - Lanza [InvalidRefreshTokenException] si el servidor rechaza el refresh
+  ///   token (401): la sesión terminó y se borran los dos tokens.
+  /// - Lanza [NetworkException] u otra [AuthException] ante un error de red o
+  ///   del servidor. Ahí no se borra nada: el access token guardado sirve para
+  ///   seguir sin conexión, y el refresh token para reintentar.
+  ///
+  /// Si ya hay un refresh en curso, devuelve ese mismo. Antes, cuando
+  /// fallaba, las llamadas que lo esperaban se quedaban colgadas para siempre.
+  Future<bool> _refresh() {
+    final pending = _refreshing;
+    if (pending != null) return pending;
+    final f = _doRefresh();
+    _refreshing = f;
+    // Se libera al terminar, con éxito o con error. El error lo recibe quien
+    // espera `f`; este future derivado solo lo descarta.
+    f.then((_) {}, onError: (_) {}).whenComplete(() {
+      if (identical(_refreshing, f)) _refreshing = null;
+    });
+    return f;
+  }
+
+  Future<bool> _doRefresh() async {
+    final rt = await storage.readRefresh();
+    if (rt == null || rt.isEmpty) return false;
+
+    final r = await _plain.postJson(config.endpoint('token'), {
+      'refresh_token': rt,
+    });
+
+    if (r.statusCode == 200) {
+      AppLogger.info('Refresh OK');
+      final body = jsonDecode(r.body) as Map<String, dynamic>;
+      final t = TokensPartial.fromJson(body); // access_token + expires_in
+      await storage.writeAccess(t.accessToken);
+      // Si el backend rota el refresh token, viene uno nuevo: se guarda.
+      final newRt = body['refresh_token'];
+      if (newRt is String && newRt.isNotEmpty) await storage.writeRefresh(newRt);
+      return true;
+    }
+
+    if (r.statusCode == 401) {
+      // Refresh token vencido o revocado (logout, cambio de contraseña): la
+      // sesión terminó. El backend responde `INVALID_TOKEN`; acá siempre se
+      // trata del refresh token.
+      await storage.clear();
+      throw InvalidRefreshTokenException(_messageOf(r), status: 401);
+    }
+
+    _throwFor(r);
+  }
+
+  String _messageOf(http.Response r) {
     try {
-      final rt = await storage.readRefresh();
-      if (rt == null || rt.isEmpty) { _refreshing!.complete(false); return false; }
-
-      final r = await _plain.postJson(config.endpoint('token'), {
-        'refresh_token': rt,
-      });
-
-      if (r.statusCode == 200) {
-        AppLogger.info('Refresh OK');
-        final body = jsonDecode(r.body) as Map<String, dynamic>;
-        final t = TokensPartial.fromJson(body); // access_token + expires_in
-        await storage.writeAccess(t.accessToken);
-        _refreshing!.complete(true);
-        return true;
-      }
-      // Si falla, limpiamos el access (no el refresh, por si el caller quiere intentar logout)
-      await storage.writeAccess('');
-      // Propagamos error específico
-      _throwFor(r);
-    } finally {
-      _refreshing = null;
-    }  
+      final e = jsonDecode(r.body) as Map<String, dynamic>;
+      return (e['error'] as String?) ?? (e['message'] as String?) ?? 'HTTP ${r.statusCode}';
+    } catch (_) {
+      return 'HTTP ${r.statusCode}';
+    }
   }
 
   // -------- Sesión --------
-  /*
-  Future<bool> ensureSession() async {
-    final jwt = await storage.readAccess();
-    if (jwt != null && jwt.isNotEmpty && !(await _isExpired(jwt, leeway: config.accessLeeway))) {
-      return true;
-    }
-    return await _refresh();
-  }
-  */
   /// Devuelve true si hay sesión utilizable (access válido),
   /// intenta refresh si expiró o está por expirar.
-  /// No lanza si el refresh falla de forma proactiva (y el token sigue vigente).
+  /// Si el refresh proactivo falla por la red o el servidor y el token sigue
+  /// vigente, no lanza: devuelve true. Si el servidor rechazó el refresh
+  /// token, lanza [InvalidRefreshTokenException] (la sesión terminó).
   Future<bool> ensureSession({Duration proactiveLeeway = const Duration(seconds: 90)}) async {
     final jwt = await storage.readAccess();
 
@@ -199,9 +235,14 @@ class AuthClient {
     );
 
     if (willExpireSoon) {
-      final ok = await _refresh();
-      // Si el refresh proactivo falla pero el token aún sirve, seguimos.
-      if (!ok) return true;
+      try {
+        await _refresh();
+      } on InvalidRefreshTokenException {
+        rethrow;
+      } on AuthException catch (e) {
+        // Sin red o error del servidor: el token todavía sirve, seguimos.
+        AppLogger.warn('Refresh proactivo falló: $e');
+      }
       return true;
     }
 
@@ -211,35 +252,31 @@ class AuthClient {
 
 
   // -------- Cliente autenticado con retry 401 --------
+  /// Header `Authorization` con el access token; vacío si no hay token
+  /// (antes mandaba `Bearer null`).
+  Future<Map<String, String>> _bearer() async {
+    final t = await storage.readAccess();
+    return (t == null || t.isEmpty) ? {} : {'Authorization': 'Bearer $t'};
+  }
+
   Future<http.Response> _authedGet(Uri url) async {
-    Future<Map<String, String>> _hdrs() async => {
-      'Authorization': 'Bearer ${await storage.readAccess()}',
-    };
-    final c = _AuthHttp(http.Client());
-    final first = await c.get(url, headers: await _hdrs());
+    final first = await _plain.get(url, headers: await _bearer());
     if (first.statusCode != 401) return first;
 
     final ok = await _refresh();
     if (!ok) return first;
 
-    final second = await c.get(url, headers: await _hdrs());
-    return second;
+    return _plain.get(url, headers: await _bearer());
   }
 
   Future<http.Response> _authedPost(Uri url, Map<String, dynamic> body) async {
-    Future<Map<String, String>> _hdrs() async => {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer ${await storage.readAccess()}',
-    };
-    final c = _AuthHttp(http.Client());
-    final first = await c.postJson(url, body, headers: await _hdrs());
+    final first = await _plain.postJson(url, body, headers: await _bearer());
     if (first.statusCode != 401) return first;
 
     final ok = await _refresh();
     if (!ok) return first;
 
-    final second = await c.postJson(url, body, headers: await _hdrs());
-    return second;
+    return _plain.postJson(url, body, headers: await _bearer());
   }
 
   // =========================
@@ -382,18 +419,6 @@ class AuthClient {
       }
     }
     await storage.clear();
-  }
-
-  // =========================
-  // Test utilitario (opcional)
-  // =========================
-  Future<Map<String, dynamic>> test() async {
-    final r = await _plain.postJson(config.endpoint('test'), {});
-    if (r.statusCode == 200 || r.statusCode == 204) {
-      if (r.body.isEmpty) return {};
-      return jsonDecode(r.body) as Map<String, dynamic>;
-    }
-    _throwFor(r);
   }
 
 }

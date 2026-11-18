@@ -26,6 +26,11 @@ class AuthConfig {
     String? webGoogleClientId,
     String Function()? language,
   }) {
+    // Los tokens y las contraseñas viajan en estos pedidos: solo HTTPS. Se
+    // permite http únicamente contra la máquina local o el emulador.
+    if (baseUrl.scheme != 'https' && !_isLocal(baseUrl)) {
+      throw ArgumentError.value(baseUrl.toString(), 'baseUrl', 'debe ser https');
+    }
     // Normaliza: asegura / final para que Uri.resolve() no pierda el último segmento
     final normalized = baseUrl.replace(
       path: baseUrl.path.endsWith('/') ? baseUrl.path : '${baseUrl.path}/',
@@ -38,6 +43,10 @@ class AuthConfig {
       language: language,
     );
   }
+
+  static bool _isLocal(Uri u) =>
+      u.scheme == 'http' &&
+      const {'localhost', '127.0.0.1', '10.0.2.2'}.contains(u.host);
 
   Uri endpoint(String path) {
     final p = path.startsWith('/') ? path.substring(1) : path;
