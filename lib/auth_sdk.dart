@@ -5,4 +5,3 @@ export 'src/storage.dart' show TokenStorage, SecureStorage;
 export 'src/models.dart';
 export 'src/providers/google_adapter.dart';
 export 'src/providers/apple_adapter.dart';
-export 'src/http_client.dart';
