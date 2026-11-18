@@ -71,7 +71,7 @@ Las rutas son relativas a `baseUrl`. Si `language` está configurado, cada pedid
 | `me` | `GET me` (Bearer) | — | 200 JSON |
 | `addPassword` | `POST add-password` (Bearer) | `new_password` | 200 (puede traer tokens nuevos) / 204 |
 | `logout` | `POST logout` | `refresh_token` | se ignoran los errores |
-| `test` | `POST test` | `{}` | 200/204 |
+| `test` | `POST test` | `{}` | **Ya no existe en el backend** (404 desde 2026-11-18, IA-079 de Corpus): exponía datos del servidor. Hay que borrar `test()` del SDK. |
 
 Los JSON van en **snake_case**: `access_token`, `refresh_token`, `token_type`, `expires_in`, `refresh_expires_at` (ISO-8601, opcional).
 
@@ -103,6 +103,8 @@ El cliente traduce la respuesta HTTP a una subclase de `AuthException`, que es u
 | red o timeout (20 s) | `NETWORK` | `NetworkException` |
 | otro | * | `UnknownAuthException` |
 
+Desde IA-079 de Corpus (2026-11-18), el body de error trae `code`, `error`, `request_id` y `timestamp`, y a veces `details.context`. Ya **no** trae `details.sqlerrm`: el detalle de los 500 queda en la base (`CRP_ERROR_LOG`), buscable por `request_id`.
+
 ## Convenciones
 
 - Comentarios y mensajes de commit en **español**. Los commits recientes usan como prefijo la versión, por ejemplo `1.8 FIX ensureSession`.
@@ -117,12 +119,12 @@ Surgieron de una revisión de seguridad del 2026-11-18. Se listan de mayor a men
 2. **`remember: false` igual guarda el refresh token** en el storage del dispositivo. Además el default no es coherente: `login` usa `false` y `socialLogin` usa `true`.
 3. **No hay `nonce`** en Sign in with Apple ni en Google, lo que permite el replay de un `id_token`. Hace falta un cambio coordinado con el backend.
 4. **`AuthHttpClient`** agrega el Bearer a cualquier host, con riesgo de filtrar el token, y `_clone` vuelve a hacer `finalize()` sobre un request ya enviado, lo que lanza `StateError` y rompe el reintento.
-5. **`_refresh()` no completa el `Completer` cuando hay un error**, así que las llamadas concurrentes que lo estaban esperando se quedan colgadas.
-6. **No se borra un refresh token inválido** (`INVALID_REFRESH_TOKEN`).
+5. **`_refresh()` no completa el `Completer` cuando hay un error**, así que las llamadas concurrentes que lo estaban esperando se quedan colgadas. **Es lo más urgente para Corpus**, que llama a `ensureSession()` en cada pedido y muchas veces al mismo tiempo: si un refresh falla, la pantalla queda cargando para siempre.
+6. **No se borra un refresh token inválido.** El backend responde 401 con `code: INVALID_TOKEN`, no `INVALID_REFRESH_TOKEN`, así que el SDK lo mapea a `InvalidAuthTokenException`. Desde IA-079 eso pasa también después de un cambio de contraseña, que cierra todas las sesiones.
 7. **El refresh token no rota.** Hace falta un cambio en el backend, y el SDK debería guardar el `refresh_token` si viene en `/token`.
 8. **`FlutterSecureStorage` está con los defaults.** Falta `encryptedSharedPreferences` en Android, `first_unlock_this_device` en iOS y `allowBackup=false`. El Keychain sobrevive a la desinstalación.
 9. **Web:** los tokens quedan en `localStorage`, expuestos a XSS. En web conviene una cookie `HttpOnly` para el refresh token.
-10. **El refresh proactivo** lanza la excepción y borra un access token que todavía era válido, en contra de lo que dice el comentario.
+10. **El refresh proactivo** lanza la excepción y borra un access token que todavía era válido, en contra de lo que dice el comentario. En Corpus afecta el modo sin conexión: sin internet y con el token por vencer, `ensureSession()` lanza `NetworkException` aunque el token todavía sirva.
 11. **Higiene:**
     - `debugPrint` también imprime en release;
     - falta declarar `http`;
@@ -130,12 +132,35 @@ Surgieron de una revisión de seguridad del 2026-11-18. Se listan de mayor a men
     - se envía `Bearer null` cuando no hay token;
     - `lang` no se valida;
     - `fromJson` puede lanzar `TypeError`;
+    - `_isExpired` lee `exp` como `int?`: si viniera con decimales, el token se tomaría siempre como vencido;
+    - `AuthHttpClient` no lo usa Corpus: conviene borrarlo en vez de arreglarlo;
     - las carpetas de plataforma son de template y el release se firma con debug keys.
 
-**Lo que se espera del backend:**
-- rate limiting en `login`, `verify-email` y `reset-password`;
-- que no se puedan enumerar cuentas;
-- códigos de un solo uso y de vida corta;
-- revocación del refresh token en `logout`;
-- validar `aud`, `iss`, `exp` y `nonce` del `id_token`;
-- lista blanca para `lang`.
+## Backend de auth (revisado el 2026-11-18)
+El backend está en el repo de Corpus (`corpus_mobile_app`):
+- `database/package_bodies/AUTH_PKG.sql`;
+- `ERR_PKG.sql`;
+- los handlers `database/ords/handlers/auth_module__*.sql`.
+
+El detalle de los hallazgos está en `SECURITY_AUDIT.md` de ese repo, sección 29.
+
+**Bien:**
+- **Códigos:** 6 dígitos con `DBMS_CRYPTO.randombytes`, 15 minutos, de un solo uso, 5 intentos fallidos por código y 5 pedidos por mail cada 24 h. "Olvidé mi contraseña" no revela si el mail tiene cuenta.
+- **Refresh token:** 32 bytes al azar. `logout` lo revoca.
+- **Google:** el token se verifica con Google; se exige `iss`, que `aud` sea de nuestro proyecto, `exp` y `email_verified`. Apple se rechaza mientras no se verifique.
+- **Configuración:** el secreto del JWT (HS256) está en `AUTH_CONFIG`, no en el código. `BYPASS_OTP = N` en producción.
+- **`lang`:** se toman las dos primeras letras; `es` da español y cualquier otro valor, inglés. No hace falta lista blanca.
+
+**Arreglado en IA-079 (Corpus #130):**
+- **Robo de cuenta con Google:** una cuenta sin verificar que se verifica con Google pierde la contraseña que tenía, sus códigos y sus sesiones.
+- **Cambiar la contraseña cierra todas las sesiones:** revoca todos los refresh tokens del usuario.
+- **`/auth/test` borrado.**
+- **Errores sin `sqlerrm`.**
+
+**Pendiente:**
+- **El login no tiene límite de intentos.**
+- **Hash de contraseña lento:** hoy es una sola pasada de SHA-256 con sal; pasar a PBKDF2, migrando cada contraseña al entrar.
+- **Access token:** dura 2,5 h (`c_access_exp_sec_short = 9000`; el comentario dice "15 min") y no se puede revocar.
+- **Refresh tokens:** están en texto plano en `AUTH_REFRESH_TOKENS` y no rotan. Si se agrega la rotación, el SDK tiene que guardar el `refresh_token` que venga en `/token`.
+- **El registro revela si un mail tiene cuenta:** responde 409 `EMAIL_ALREADY_EXISTS`.
+- **No hay `nonce`** en el login con Google.
