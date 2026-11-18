@@ -2,7 +2,7 @@
 
 SDK interno en Flutter/Dart para autenticar apps contra el backend de auth de GLOBA, que es un servicio REST en ORDS (por ejemplo `https://globa.space/ords/corpus/auth/`). Cubre el login con email y contraseña, el login social con Google y Apple, el manejo de tokens (access y refresh) y los endpoints de la cuenta.
 
-> Estado: versión `0.1.0`, `publish_to: none`, de uso interno. La estructura todavía es la de una **app** Flutter (`lib/main.dart` "Hello World" y carpetas de plataforma de template), no la de un package.
+> Estado: versión `0.2.0`, `publish_to: none`, de uso interno. La estructura todavía es la de una **app** Flutter (`lib/main.dart` "Hello World" y carpetas de plataforma de template), no la de un package.
 
 ## Stack
 
@@ -10,7 +10,7 @@ SDK interno en Flutter/Dart para autenticar apps contra el backend de auth de GL
 - `flutter_secure_storage ^9.2.4`: guarda los tokens
 - `google_sign_in ^7.2.0`: API v7, con `initialize` y `authenticate`
 - `sign_in_with_apple ^7.0.1`
-- `http`: se usa pero **no está declarado** en `pubspec.yaml` (llega como dependencia transitiva)
+- `http ^1.2.2`: los pedidos al backend (un solo `http.Client` por `AuthClient`, inyectable para tests)
 
 ## Estructura
 
@@ -20,15 +20,16 @@ lib/
   src/
     config.dart                 # AuthConfig: baseUrl, leeway, client IDs de Google, idioma
     auth_client.dart            # AuthClient + excepciones tipadas + _AuthHttp (helper privado)
-    http_client.dart            # AuthHttpClient (BaseClient con Bearer + retry 401), hoy sin uso interno
     models.dart                 # Tokens, TokensPartial
     storage.dart                # TokenStorage (interfaz) + SecureStorage
     providers/
       google_adapter.dart       # Devuelve el id_token de Google
       apple_adapter.dart        # Devuelve el identityToken de Apple
     widgets/                    # apple/google_signin_button.dart (archivos vacíos)
-  util/logger.dart              # AppLogger (debugPrint con colores)
-test/config_test.dart           # Tests de AuthConfig.endpoint / ?lang=
+  util/logger.dart              # AppLogger (debugPrint con colores, solo en debug)
+test/
+  config_test.dart              # AuthConfig.endpoint / ?lang=
+  auth_client_test.dart         # refresh, ensureSession, Bearer, solo https (con MockClient)
 ```
 
 ## Uso básico
@@ -71,7 +72,8 @@ Las rutas son relativas a `baseUrl`. Si `language` está configurado, cada pedid
 | `me` | `GET me` (Bearer) | — | 200 JSON |
 | `addPassword` | `POST add-password` (Bearer) | `new_password` | 200 (puede traer tokens nuevos) / 204 |
 | `logout` | `POST logout` | `refresh_token` | se ignoran los errores |
-| `test` | `POST test` | `{}` | **Ya no existe en el backend** (404 desde 2026-11-18, IA-079 de Corpus): exponía datos del servidor. Hay que borrar `test()` del SDK. |
+
+`AuthClient.test()` se borró en 0.2.0: el endpoint `POST test` ya no existe en el backend (404 desde IA-079 de Corpus, porque exponía datos del servidor).
 
 Los JSON van en **snake_case**: `access_token`, `refresh_token`, `token_type`, `expires_in`, `refresh_expires_at` (ISO-8601, opcional).
 
@@ -82,7 +84,12 @@ Los JSON van en **snake_case**: `access_token`, `refresh_token`, `token_type`, `
   - sin access token → refresh;
   - access token vencido (`exp - accessLeeway`) → refresh obligatorio;
   - por vencer (`accessLeeway + 90s`) → refresh proactivo.
-- `_refresh()` comparte un único `Completer` entre llamadas concurrentes para no hacer refresh en paralelo. `/token` devuelve **solo** el access token: el refresh token no rota.
+- Proactivo: si falla por la red o por el servidor, devuelve `true` con el token que todavía sirve; solo lanza si el servidor rechazó la sesión.
+- `_refresh()` comparte un único `Future` entre llamadas concurrentes: todas reciben el mismo resultado o el mismo error, y no se hace refresh en paralelo.
+- **401 en `/token`:** lanza `InvalidRefreshTokenException` y borra los dos tokens. El backend responde `code: INVALID_TOKEN`, pero en `/token` siempre se trata del refresh token.
+- **Sin red o con error del servidor:** lanza `NetworkException` u otra `AuthException` y **no borra nada**. Corpus usa el access token guardado, aunque esté vencido, para el modo sin conexión.
+- Hoy `/token` devuelve solo el access token. Si algún día devuelve también `refresh_token` (rotación), el SDK lo guarda.
+- `baseUrl` tiene que ser `https`; `http` solo se acepta contra `localhost`, `127.0.0.1` o `10.0.2.2` (el emulador).
 - `_authedGet` y `_authedPost` reintentan una sola vez si reciben 401, después de un refresh.
 - El JWT se decodifica **sin verificar la firma**, solo para leer `exp`. Nunca hay que confiar en sus claims del lado del cliente.
 
@@ -95,7 +102,7 @@ El cliente traduce la respuesta HTTP a una subclase de `AuthException`, que es u
 | 400 | * | `BadRequestException` |
 | 401 | `INVALID_CREDENTIALS` | `InvalidCredentialsException` |
 | 401 | `INVALID_TOKEN`, `INVALID_AUTH_TOKEN`, otro | `InvalidAuthTokenException` |
-| 401 | `INVALID_REFRESH_TOKEN` | `InvalidRefreshTokenException` |
+| 401 | `INVALID_REFRESH_TOKEN`, o cualquier 401 en `/token` | `InvalidRefreshTokenException` |
 | 403 | `EMAIL_NOT_VERIFIED` / otro | `EmailNotVerifiedException` / `AccessDeniedException` |
 | 409 | `EMAIL_ALREADY_EXISTS` / `USER_PASSWORD_EXISTS` | `ConflictUserExistsException` / `PasswordExistsException` |
 | 429 | * | `RateLimitedException` |
@@ -113,28 +120,35 @@ Desde IA-079 de Corpus (2026-11-18), el body de error trae `code`, `error`, `req
 
 ## Problemas conocidos / pendientes de seguridad
 
-Surgieron de una revisión de seguridad del 2026-11-18. Se listan de mayor a menor prioridad.
+Surgieron de una revisión de seguridad del 2026-11-18.
 
-1. **No se obliga a usar HTTPS** en `AuthConfig.baseUrl`.
-2. **`remember: false` igual guarda el refresh token** en el storage del dispositivo. Además el default no es coherente: `login` usa `false` y `socialLogin` usa `true`.
-3. **No hay `nonce`** en Sign in with Apple ni en Google, lo que permite el replay de un `id_token`. Hace falta un cambio coordinado con el backend.
-4. **`AuthHttpClient`** agrega el Bearer a cualquier host, con riesgo de filtrar el token, y `_clone` vuelve a hacer `finalize()` sobre un request ya enviado, lo que lanza `StateError` y rompe el reintento.
-5. **`_refresh()` no completa el `Completer` cuando hay un error**, así que las llamadas concurrentes que lo estaban esperando se quedan colgadas. **Es lo más urgente para Corpus**, que llama a `ensureSession()` en cada pedido y muchas veces al mismo tiempo: si un refresh falla, la pantalla queda cargando para siempre.
-6. **No se borra un refresh token inválido.** El backend responde 401 con `code: INVALID_TOKEN`, no `INVALID_REFRESH_TOKEN`, así que el SDK lo mapea a `InvalidAuthTokenException`. Desde IA-079 eso pasa también después de un cambio de contraseña, que cierra todas las sesiones.
-7. **El refresh token no rota.** Hace falta un cambio en el backend, y el SDK debería guardar el `refresh_token` si viene en `/token`.
-8. **`FlutterSecureStorage` está con los defaults.** Falta `encryptedSharedPreferences` en Android, `first_unlock_this_device` en iOS y `allowBackup=false`. El Keychain sobrevive a la desinstalación.
-9. **Web:** los tokens quedan en `localStorage`, expuestos a XSS. En web conviene una cookie `HttpOnly` para el refresh token.
-10. **El refresh proactivo** lanza la excepción y borra un access token que todavía era válido, en contra de lo que dice el comentario. En Corpus afecta el modo sin conexión: sin internet y con el token por vencer, `ensureSession()` lanza `NetworkException` aunque el token todavía sirva.
-11. **Higiene:**
-    - `debugPrint` también imprime en release;
-    - falta declarar `http`;
-    - se crea un `http.Client` en cada pedido y no se cierra;
-    - se envía `Bearer null` cuando no hay token;
-    - `lang` no se valida;
-    - `fromJson` puede lanzar `TypeError`;
-    - `_isExpired` lee `exp` como `int?`: si viniera con decimales, el token se tomaría siempre como vencido;
-    - `AuthHttpClient` no lo usa Corpus: conviene borrarlo en vez de arreglarlo;
-    - las carpetas de plataforma son de template y el release se firma con debug keys.
+**Arreglado en 0.2.0** (IA-080 de Corpus):
+- **El refresh que fallaba dejaba colgadas** las llamadas concurrentes que lo esperaban.
+- **El refresh proactivo:** lanzaba la excepción y borraba un access token que todavía era válido. Sin conexión, la app no podía seguir.
+- **No se borraba un refresh token rechazado.**
+- **HTTPS obligatorio** en `baseUrl`.
+- **`AuthHttpClient` borrado:** agregaba el Bearer a cualquier host y su reintento lanzaba `StateError`; nadie lo usaba.
+- **Higiene:**
+  - `http` declarado;
+  - un solo `http.Client` y `close()`;
+  - sin `Bearer null`;
+  - `exp` con decimales;
+  - `AppLogger` solo en debug;
+  - `test()` borrado.
+
+**Pendiente:**
+1. **`remember: false` igual guarda el refresh token** en el dispositivo (el backend lo hace durar 1 día en vez de 30). Además el default no es coherente: `login` usa `false` y `socialLogin`, `true`. Cambiarlo es una decisión de producto: sin "recordarme", la sesión no sobreviviría a cerrar la app.
+2. **No hay `nonce`** en Sign in with Apple ni en Google, lo que permite el replay de un `id_token`. Hace falta un cambio coordinado con el backend.
+3. **El refresh token no rota.** El SDK ya está listo; falta el backend.
+4. **`FlutterSecureStorage` está con los defaults:** falta `encryptedSharedPreferences` en Android y `first_unlock_this_device` en iOS.
+   - Ojo: activar `encryptedSharedPreferences` deja sin acceso a lo guardado antes, así que cierra la sesión de todos una vez.
+   - Corpus ya tiene `allowBackup="false"`.
+   - El Keychain sobrevive a la desinstalación.
+5. **Web:** los tokens quedan en `localStorage`, expuestos a XSS. En web conviene una cookie `HttpOnly` para el refresh token.
+6. **Higiene:**
+   - `fromJson` puede lanzar `TypeError` si el backend cambia el formato;
+   - las carpetas de plataforma son de template y el release se firma con debug keys;
+   - la estructura sigue siendo la de una app, no la de un package.
 
 ## Backend de auth (revisado el 2026-11-18)
 El backend está en el repo de Corpus (`corpus_mobile_app`):
@@ -161,6 +175,6 @@ El detalle de los hallazgos está en `SECURITY_AUDIT.md` de ese repo, sección 2
 - **El login no tiene límite de intentos.**
 - **Hash de contraseña lento:** hoy es una sola pasada de SHA-256 con sal; pasar a PBKDF2, migrando cada contraseña al entrar.
 - **Access token:** dura 2,5 h (`c_access_exp_sec_short = 9000`; el comentario dice "15 min") y no se puede revocar.
-- **Refresh tokens:** están en texto plano en `AUTH_REFRESH_TOKENS` y no rotan. Si se agrega la rotación, el SDK tiene que guardar el `refresh_token` que venga en `/token`.
+- **Refresh tokens:** están en texto plano en `AUTH_REFRESH_TOKENS` y no rotan. Desde 0.2.0 el SDK ya guarda el `refresh_token` si viene en `/token`.
 - **El registro revela si un mail tiene cuenta:** responde 409 `EMAIL_ALREADY_EXISTS`.
 - **No hay `nonce`** en el login con Google.
