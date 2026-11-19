@@ -101,13 +101,30 @@ class AuthClient {
     return json.decode(payload) as Map<String, dynamic>;
   }
 
+  /// Diferencia entre el reloj del servidor y el del teléfono (servidor −
+  /// teléfono). Se aprende con cada token recibido: `exp - expires_in` es la
+  /// hora del servidor al emitirlo. Con access tokens de 15 minutos, un
+  /// teléfono con la hora corrida unos minutos veía cada token nuevo como
+  /// vencido y renovaba en cada pedido. Al arrancar vale cero: como mucho se
+  /// hace un refresh de más, y desde ahí se usa la diferencia aprendida.
+  Duration _clockSkew = Duration.zero;
+
+  void _learnClockSkew(String accessToken, int expiresIn) {
+    try {
+      final exp = (_decodePayload(accessToken)['exp'] as num?)?.toInt();
+      if (exp == null) return;
+      final serverNow = DateTime.fromMillisecondsSinceEpoch((exp - expiresIn) * 1000);
+      _clockSkew = serverNow.difference(DateTime.now());
+    } catch (_) {}
+  }
+
   Future<bool> _isExpired(String jwt, {Duration leeway = const Duration(seconds: 15)}) async {
     try {
       final payload = _decodePayload(jwt);
       final exp = (payload['exp'] as num?)?.toInt();
       if (exp == null) return true;
       final expDt = DateTime.fromMillisecondsSinceEpoch(exp * 1000).subtract(leeway);
-      return DateTime.now().isAfter(expDt);
+      return DateTime.now().add(_clockSkew).isAfter(expDt);
     } catch (_) { return true; }
   }
 
@@ -186,6 +203,7 @@ class AuthClient {
       final body = jsonDecode(r.body) as Map<String, dynamic>;
       final t = TokensPartial.fromJson(body); // access_token + expires_in
       await storage.writeAccess(t.accessToken);
+      _learnClockSkew(t.accessToken, t.expiresIn);
       // Viene el refresh token nuevo (rotación): se guarda.
       final newRt = body['refresh_token'];
       if (newRt is String && newRt.isNotEmpty) await storage.writeRefresh(newRt);
@@ -349,6 +367,7 @@ class AuthClient {
     if (r.statusCode == 200) {
       final t = Tokens.fromJson(jsonDecode(r.body) as Map<String, dynamic>);
       await storage.writeAccess(t.accessToken);
+      _learnClockSkew(t.accessToken, t.expiresIn);
       await storage.writeRefresh(t.refreshToken);
       return t;
     }
@@ -365,6 +384,7 @@ class AuthClient {
     if (r.statusCode == 200) {
       final t = Tokens.fromJson(jsonDecode(r.body) as Map<String, dynamic>);
       await storage.writeAccess(t.accessToken);
+      _learnClockSkew(t.accessToken, t.expiresIn);
       await storage.writeRefresh(t.refreshToken);
       return t;
     }
@@ -401,6 +421,7 @@ class AuthClient {
         if (body.containsKey('access_token') && body.containsKey('refresh_token')) {
           final t = Tokens.fromJson(body);
           await storage.writeAccess(t.accessToken);
+          _learnClockSkew(t.accessToken, t.expiresIn);
           await storage.writeRefresh(t.refreshToken);
         }
       } catch (_) {}

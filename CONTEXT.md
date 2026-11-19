@@ -98,6 +98,7 @@ Los JSON van en **snake_case**: `access_token`, `refresh_token`, `token_type`, `
 - `baseUrl` tiene que ser `https`; `http` solo se acepta contra `localhost`, `127.0.0.1` o `10.0.2.2` (el emulador).
 - `_authedGet` y `_authedPost` reintentan una sola vez si reciben 401, después de un refresh.
 - El JWT se decodifica **sin verificar la firma**, solo para leer `exp`. Nunca hay que confiar en sus claims del lado del cliente.
+- **Reloj del teléfono (0.3.0):** el vencimiento se mide con la diferencia entre el reloj del servidor y el del teléfono, que se aprende con cada token (`exp - expires_in`). Sin eso, con tokens de 15 minutos, un teléfono con la hora corrida renovaba en cada pedido. La zona horaria no importa: `exp` y `DateTime` son instantes absolutos.
 
 ## Errores
 

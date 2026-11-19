@@ -151,6 +151,26 @@ void main() {
     });
   });
 
+  test('con el reloj del teléfono corrido no renueva en cada pedido', () async {
+    // El servidor va 3 horas atrasado respecto del teléfono: sus tokens de
+    // 15 minutos, medidos con el reloj del teléfono, ya vencieron.
+    var calls = 0;
+    final server = DateTime.now().subtract(const Duration(hours: 3));
+    final client = AuthClient(
+      config: config,
+      storage: MemoryStorage(refresh: 'rt'),
+      httpClient: MockClient((req) async {
+        calls++;
+        final exp = server.millisecondsSinceEpoch ~/ 1000 + 900;
+        return json(200, {'access_token': jwt(exp: exp), 'token_type': 'Bearer', 'expires_in': 900});
+      }),
+    );
+    expect(await client.ensureSession(), isTrue); // sin access: renueva
+    expect(await client.ensureSession(), isTrue);
+    expect(await client.ensureSession(), isTrue);
+    expect(calls, 1);
+  });
+
   test('un exp con decimales se lee bien (no se toma como vencido)', () async {
     var calls = 0;
     final client = AuthClient(
