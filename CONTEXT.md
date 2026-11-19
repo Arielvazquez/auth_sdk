@@ -191,7 +191,15 @@ El detalle de los hallazgos está en `SECURITY_AUDIT.md` de ese repo, sección 2
 - **Refresh tokens:** se guarda su SHA-256 y rotan si el cliente lo pide (ver "Manejo de sesión").
 - **`logout`:** respondía 555 y nunca revocaba el refresh token (le faltaba el parámetro `X-APEX-STATUS-CODE`). Ahora lo revoca.
 
+**Arreglado en IA-086 e IA-088 de Corpus (2026-11-19):**
+- **`nonce` en el login con Google:** `POST nonce` lo da y `social-login` lo exige y lo borra (`GOOGLE_NONCE_REQUIRED = Y`).
+- **Access token revocable por sesión:** lleva `sid` (el primer refresh token de la cadena; las rotaciones lo heredan) y el backend exige que esa sesión siga abierta.
+  - El logout lo invalida al instante, solo para esa sesión.
+  - El cambio de contraseña o un token robado invalidan todas las sesiones, y la app recibe 401.
+- **El registro ya no revela si el mail tiene cuenta:** siempre responde 201.
+  - **Cuenta verificada:** al dueño le llega un aviso.
+  - **Cuenta sin verificar:** se reemplaza la contraseña y se reenvía el código.
+  - `ConflictUserExistsException` ya no sale del registro.
+
 **Pendiente:**
-- **El access token no se puede revocar:** dura hasta 15 minutos después de un logout o de un cambio de contraseña.
-- **El registro revela si un mail tiene cuenta:** responde 409 `EMAIL_ALREADY_EXISTS`.
-- **No hay `nonce`** en el login con Google.
+- **Sign in with Apple** y su `nonce` (IA-087 de Corpus, cuando se publique en iOS).
