@@ -151,6 +151,72 @@ void main() {
     });
   });
 
+  group('remember', () {
+    Map<String, dynamic> tokens(String rt) => {
+          'access_token': jwt(exp: inSeconds(3600)),
+          'refresh_token': rt,
+          'token_type': 'Bearer',
+          'expires_in': 900,
+        };
+
+    test('con remember (por defecto) guarda el refresh token', () async {
+      final storage = MemoryStorage();
+      final client = AuthClient(
+        config: config,
+        storage: storage,
+        httpClient: MockClient((req) async => json(200, tokens('rt1'))),
+      );
+      await client.login('a@b.c', 'x');
+      expect(storage.refresh, 'rt1');
+    });
+
+    test('sin remember el refresh token queda solo en memoria, y rota ahí', () async {
+      final storage = MemoryStorage(refresh: 'de-otra-sesion');
+      final sent = <String>[];
+      final client = AuthClient(
+        config: config,
+        storage: storage,
+        httpClient: MockClient((req) async {
+          if (req.url.path.endsWith('/login')) return json(200, tokens('rt1'));
+          final body = jsonDecode(req.body) as Map<String, dynamic>;
+          if (req.url.path.endsWith('/token')) {
+            sent.add(body['refresh_token'] as String);
+            return json(200, tokens('rt2'));
+          }
+          sent.add('logout:${body['refresh_token']}');
+          return json(200, {});
+        }),
+      );
+      await client.login('a@b.c', 'x', remember: false);
+      expect(storage.refresh, isNull);
+      storage.access = null; // fuerza la renovación
+      expect(await client.ensureSession(), isTrue);
+      expect(storage.refresh, isNull);
+      await client.logout();
+      expect(sent, ['rt1', 'logout:rt2']);
+    });
+  });
+
+  group('respuestas con otro formato', () {
+    test('login con un body que no es JSON: InvalidResponseException', () async {
+      final client = AuthClient(
+        config: config,
+        storage: MemoryStorage(),
+        httpClient: MockClient((req) async => http.Response('<html>', 200)),
+      );
+      await expectLater(client.login('a@b.c', 'x'), throwsA(isA<InvalidResponseException>()));
+    });
+
+    test('login sin access_token: InvalidResponseException (antes TypeError)', () async {
+      final client = AuthClient(
+        config: config,
+        storage: MemoryStorage(),
+        httpClient: MockClient((req) async => json(200, {'token_type': 'Bearer'})),
+      );
+      await expectLater(client.login('a@b.c', 'x'), throwsA(isA<InvalidResponseException>()));
+    });
+  });
+
   test('con el reloj del teléfono corrido no renueva en cada pedido', () async {
     // El servidor va 3 horas atrasado respecto del teléfono: sus tokens de
     // 15 minutos, medidos con el reloj del teléfono, ya vencieron.
