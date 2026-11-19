@@ -5,14 +5,19 @@ class GoogleSignInAdapter {
     String? iosClientId,
     required String webClientId, // Web OAuth client ID (.apps.googleusercontent.com)
     bool fresh = false,
+    // 0.5.0: el de AuthClient.requestNonce(). Google lo pone en el id_token.
+    String? nonce,
   }) async {
 
     final g = GoogleSignIn.instance;
 
-    // Inicializar (v7)
+    // Inicializar (v7). Se llama en cada login para pasar el nonce nuevo: en
+    // Android `initialize` solo guarda los parámetros (google_sign_in_android
+    // 7.2). En iOS no está probado.
     await g.initialize(
       clientId: iosClientId,                 // iOS (opcional)
       serverClientId: webClientId,           // Android/iOS → aud esperado
+      nonce: nonce,
     );
 
     // Limpieza para evitar reauth/caches raros (MIUI/CM)
