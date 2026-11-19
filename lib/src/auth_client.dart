@@ -410,6 +410,20 @@ class AuthClient {
     _throwFor(r);
   }
 
+  /// 0.5.0: nonce de un solo uso para el login con Google. Se le pasa a
+  /// [GoogleSignInAdapter.signInAndGetIdToken], Google lo pone en el
+  /// `id_token` y el backend lo exige y lo borra en `social-login`: un token
+  /// de Google interceptado no sirve para entrar otra vez.
+  Future<String> requestNonce() async {
+    final r = await _plain.postJson(config.endpoint('nonce'), {});
+    if (r.statusCode == 200) {
+      final nonce = _json(r)['nonce'];
+      if (nonce is String && nonce.isNotEmpty) return nonce;
+      throw InvalidResponseException('Respuesta inesperada del servidor', status: r.statusCode);
+    }
+    _throwFor(r);
+  }
+
   // =========================
   // Auth (login / social)
   // =========================

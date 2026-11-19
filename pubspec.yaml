@@ -1,7 +1,7 @@
 name: auth_sdk
 description: "SDK de autenticación de GLOBA contra el backend de auth en ORDS."
 publish_to: 'none'
-version: 0.4.0
+version: 0.5.0
 
 environment:
   sdk: ^3.9.0

@@ -197,6 +197,31 @@ void main() {
     });
   });
 
+  group('requestNonce', () {
+    test('pide POST nonce y devuelve el nonce', () async {
+      Uri? called;
+      final client = AuthClient(
+        config: config,
+        storage: MemoryStorage(),
+        httpClient: MockClient((req) async {
+          called = req.url;
+          return json(200, {'nonce': 'abc123'});
+        }),
+      );
+      expect(await client.requestNonce(), 'abc123');
+      expect(called.toString(), 'https://example.test/auth/nonce');
+    });
+
+    test('sin nonce en la respuesta: InvalidResponseException', () async {
+      final client = AuthClient(
+        config: config,
+        storage: MemoryStorage(),
+        httpClient: MockClient((req) async => json(200, {})),
+      );
+      await expectLater(client.requestNonce(), throwsA(isA<InvalidResponseException>()));
+    });
+  });
+
   group('respuestas con otro formato', () {
     test('login con un body que no es JSON: InvalidResponseException', () async {
       final client = AuthClient(
