@@ -106,19 +106,24 @@ void main() {
       }
     });
 
-    test('si el backend manda un refresh token nuevo, se guarda', () async {
+    test('pide rotar y guarda el refresh token nuevo', () async {
       final storage = MemoryStorage(refresh: 'viejo');
+      Map<String, dynamic>? sent;
       final client = AuthClient(
         config: config,
         storage: storage,
-        httpClient: MockClient((req) async => json(200, {
+        httpClient: MockClient((req) async {
+          sent = jsonDecode(req.body) as Map<String, dynamic>;
+          return json(200, {
               'access_token': jwt(exp: inSeconds(3600)),
               'token_type': 'Bearer',
               'expires_in': 3600,
               'refresh_token': 'nuevo',
-            })),
+            });
+        }),
       );
       expect(await client.ensureSession(), isTrue);
+      expect(sent, {'refresh_token': 'viejo', 'rotate': true});
       expect(storage.refresh, 'nuevo');
     });
   });

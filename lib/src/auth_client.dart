@@ -173,8 +173,12 @@ class AuthClient {
     final rt = await storage.readRefresh();
     if (rt == null || rt.isEmpty) return false;
 
+    // 0.3.0: pide rotar el refresh token. El backend devuelve uno nuevo y
+    // revoca el que se mandó; si alguien reusa uno viejo, cierra todas las
+    // sesiones del usuario.
     final r = await _plain.postJson(config.endpoint('token'), {
       'refresh_token': rt,
+      'rotate': true,
     });
 
     if (r.statusCode == 200) {
@@ -182,7 +186,7 @@ class AuthClient {
       final body = jsonDecode(r.body) as Map<String, dynamic>;
       final t = TokensPartial.fromJson(body); // access_token + expires_in
       await storage.writeAccess(t.accessToken);
-      // Si el backend rota el refresh token, viene uno nuevo: se guarda.
+      // Viene el refresh token nuevo (rotación): se guarda.
       final newRt = body['refresh_token'];
       if (newRt is String && newRt.isNotEmpty) await storage.writeRefresh(newRt);
       return true;

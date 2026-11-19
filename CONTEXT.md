@@ -2,7 +2,7 @@
 
 SDK interno en Flutter/Dart para autenticar apps contra el backend de auth de GLOBA, que es un servicio REST en ORDS (por ejemplo `https://globa.space/ords/corpus/auth/`). Cubre el login con email y contraseña, el login social con Google y Apple, el manejo de tokens (access y refresh) y los endpoints de la cuenta.
 
-> Estado: versión `0.2.0`, `publish_to: none`, de uso interno. La estructura todavía es la de una **app** Flutter (`lib/main.dart` "Hello World" y carpetas de plataforma de template), no la de un package.
+> Estado: versión `0.3.0`, `publish_to: none`, de uso interno. La estructura todavía es la de una **app** Flutter (`lib/main.dart` "Hello World" y carpetas de plataforma de template), no la de un package.
 
 ## Stack
 
@@ -68,7 +68,7 @@ Las rutas son relativas a `baseUrl`. Si `language` está configurado, cada pedid
 | `resetPassword` | `POST reset-password` | `email, code, new_password` | 200 |
 | `login` | `POST login` | `email, password, remember` | 200 `Tokens` |
 | `socialLogin` | `POST social-login` | `provider ('google'\|'apple'), id_token, remember` | 200 `Tokens` |
-| (refresh interno) | `POST token` | `refresh_token` | 200 `TokensPartial` |
+| (refresh interno) | `POST token` | `refresh_token, rotate: true` | 200 `TokensPartial` + `refresh_token` nuevo |
 | `me` | `GET me` (Bearer) | — | 200 JSON |
 | `addPassword` | `POST add-password` (Bearer) | `new_password` | 200 (puede traer tokens nuevos) / 204 |
 | `logout` | `POST logout` | `refresh_token` | se ignoran los errores |
@@ -88,7 +88,13 @@ Los JSON van en **snake_case**: `access_token`, `refresh_token`, `token_type`, `
 - `_refresh()` comparte un único `Future` entre llamadas concurrentes: todas reciben el mismo resultado o el mismo error, y no se hace refresh en paralelo.
 - **401 en `/token`:** lanza `InvalidRefreshTokenException` y borra los dos tokens. El backend responde `code: INVALID_TOKEN`, pero en `/token` siempre se trata del refresh token.
 - **Sin red o con error del servidor:** lanza `NetworkException` u otra `AuthException` y **no borra nada**. Corpus usa el access token guardado, aunque esté vencido, para el modo sin conexión.
-- Hoy `/token` devuelve solo el access token. Si algún día devuelve también `refresh_token` (rotación), el SDK lo guarda.
+- **Rotación (desde 0.3.0):** el SDK manda `rotate: true` en `/token` y guarda el `refresh_token` nuevo que vuelve.
+  - El backend revoca el que se mandó.
+  - Si después llega uno ya rotado:
+    - con menos de 60 s: da otro (la app y su tarea en segundo plano renovando a la vez);
+    - si su reemplazo nunca se usó: da otro (se perdió la respuesta);
+    - si su reemplazo ya se usó: alguien lo robó, y se cierran todas las sesiones del usuario.
+  - Los clientes que no mandan `rotate` (0.2.0 o anteriores) siguen sin rotación.
 - `baseUrl` tiene que ser `https`; `http` solo se acepta contra `localhost`, `127.0.0.1` o `10.0.2.2` (el emulador).
 - `_authedGet` y `_authedPost` reintentan una sola vez si reciben 401, después de un refresh.
 - El JWT se decodifica **sin verificar la firma**, solo para leer `exp`. Nunca hay que confiar en sus claims del lado del cliente.
@@ -122,6 +128,8 @@ Desde IA-079 de Corpus (2026-11-18), el body de error trae `code`, `error`, `req
 
 Surgieron de una revisión de seguridad del 2026-11-18.
 
+**Arreglado en 0.3.0** (IA-083 de Corpus): el SDK pide la rotación del refresh token.
+
 **Arreglado en 0.2.0** (IA-080 de Corpus):
 - **El refresh que fallaba dejaba colgadas** las llamadas concurrentes que lo esperaban.
 - **El refresh proactivo:** lanzaba la excepción y borraba un access token que todavía era válido. Sin conexión, la app no podía seguir.
@@ -139,13 +147,12 @@ Surgieron de una revisión de seguridad del 2026-11-18.
 **Pendiente:**
 1. **`remember: false` igual guarda el refresh token** en el dispositivo (el backend lo hace durar 1 día en vez de 30). Además el default no es coherente: `login` usa `false` y `socialLogin`, `true`. Cambiarlo es una decisión de producto: sin "recordarme", la sesión no sobreviviría a cerrar la app.
 2. **No hay `nonce`** en Sign in with Apple ni en Google, lo que permite el replay de un `id_token`. Hace falta un cambio coordinado con el backend.
-3. **El refresh token no rota.** El SDK ya está listo; falta el backend.
-4. **`FlutterSecureStorage` está con los defaults:** falta `encryptedSharedPreferences` en Android y `first_unlock_this_device` en iOS.
+3. **`FlutterSecureStorage` está con los defaults:** falta `encryptedSharedPreferences` en Android y `first_unlock_this_device` en iOS.
    - Ojo: activar `encryptedSharedPreferences` deja sin acceso a lo guardado antes, así que cierra la sesión de todos una vez.
    - Corpus ya tiene `allowBackup="false"`.
    - El Keychain sobrevive a la desinstalación.
-5. **Web:** los tokens quedan en `localStorage`, expuestos a XSS. En web conviene una cookie `HttpOnly` para el refresh token.
-6. **Higiene:**
+4. **Web:** los tokens quedan en `localStorage`, expuestos a XSS. En web conviene una cookie `HttpOnly` para el refresh token.
+5. **Higiene:**
    - `fromJson` puede lanzar `TypeError` si el backend cambia el formato;
    - las carpetas de plataforma son de template y el release se firma con debug keys;
    - la estructura sigue siendo la de una app, no la de un package.
@@ -171,10 +178,16 @@ El detalle de los hallazgos está en `SECURITY_AUDIT.md` de ese repo, sección 2
 - **`/auth/test` borrado.**
 - **Errores sin `sqlerrm`.**
 
+**Arreglado en IA-083 (2026-11-18):**
+- **Límite de logins fallidos:** 10 por mail en 15 minutos, la cuenta exista o no; después, 429 `TOO_MANY_LOGIN_ATTEMPTS`. Cambiar la contraseña con el código del mail lo destraba.
+- **Contraseñas con PBKDF2-HMAC-SHA256** (50.000 iteraciones, unos 0,45 s):
+  - las del formato viejo se migran en el próximo login;
+  - con un mail sin cuenta se hace el mismo trabajo, así que el tiempo de respuesta no revela qué mails tienen cuenta.
+- **Access token de 15 minutos.**
+- **Refresh tokens:** se guarda su SHA-256 y rotan si el cliente lo pide (ver "Manejo de sesión").
+- **`logout`:** respondía 555 y nunca revocaba el refresh token (le faltaba el parámetro `X-APEX-STATUS-CODE`). Ahora lo revoca.
+
 **Pendiente:**
-- **El login no tiene límite de intentos.**
-- **Hash de contraseña lento:** hoy es una sola pasada de SHA-256 con sal; pasar a PBKDF2, migrando cada contraseña al entrar.
-- **Access token:** dura 2,5 h (`c_access_exp_sec_short = 9000`; el comentario dice "15 min") y no se puede revocar.
-- **Refresh tokens:** están en texto plano en `AUTH_REFRESH_TOKENS` y no rotan. Desde 0.2.0 el SDK ya guarda el `refresh_token` si viene en `/token`.
+- **El access token no se puede revocar:** dura hasta 15 minutos después de un logout o de un cambio de contraseña.
 - **El registro revela si un mail tiene cuenta:** responde 409 `EMAIL_ALREADY_EXISTS`.
 - **No hay `nonce`** en el login con Google.
