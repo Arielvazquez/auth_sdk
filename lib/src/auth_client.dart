@@ -21,7 +21,7 @@ sealed class AuthException implements Exception {
   String toString() => '$code: $message${status != null ? ' (HTTP $status)' : ''}';
 }
 
-class BadRequestException extends AuthException { BadRequestException(String code, String msg, {int? status}) : super(code, msg, status: status); }
+class BadRequestException extends AuthException { BadRequestException(super.code, super.message, {super.status}); }
 class InvalidCredentialsException extends AuthException { InvalidCredentialsException(String msg, {int? status}) : super('INVALID_CREDENTIALS', msg, status: status); }
 class EmailNotVerifiedException extends AuthException { EmailNotVerifiedException(String msg, {int? status}) : super('EMAIL_NOT_VERIFIED', msg, status: status); }
 class InvalidExternalTokenException extends AuthException { InvalidExternalTokenException(String msg, {int? status}) : super('INVALID_EXTERNAL_TOKEN', msg, status: status); }
@@ -34,14 +34,17 @@ class RateLimitedException extends AuthException { RateLimitedException(String m
 class ServerErrorException extends AuthException { ServerErrorException(String msg, {int? status}) : super('INTERNAL_SERVER_ERROR', msg, status: status); }
 class NetworkException extends AuthException { NetworkException(String msg) : super('NETWORK', msg); }
 class UnknownAuthException extends AuthException { UnknownAuthException(String msg, {int? status}) : super('UNKNOWN', msg, status: status); }
+/// 0.4.0: la respuesta del servidor no tiene el formato esperado (antes salía
+/// un `TypeError` o un `FormatException` sin tipo de auth).
+class InvalidResponseException extends AuthException { InvalidResponseException(String msg, {int? status}) : super('INVALID_RESPONSE', msg, status: status); }
 
 /// =====================
 /// Auth HTTP: helper privado
 /// =====================
 class _AuthHttp {
   final http.Client _client;
-  final Duration timeout;
-  _AuthHttp(this._client, {this.timeout = const Duration(seconds: 20)});
+  static const timeout = Duration(seconds: 20);
+  _AuthHttp(this._client);
 
   void close() => _client.close();
 
@@ -186,8 +189,53 @@ class AuthClient {
     return f;
   }
 
+  /// 0.4.0: refresh token de una sesión sin "recordarme". Queda solo en
+  /// memoria: la sesión dura lo que dure el proceso (antes se guardaba igual
+  /// en el dispositivo).
+  String? _sessionRefresh;
+
+  Future<String?> _readRefresh() async => _sessionRefresh ?? await storage.readRefresh();
+
+  /// Guarda los tokens de un login. Con [remember], el refresh token va al
+  /// almacenamiento seguro; sin él, solo a memoria.
+  Future<void> _saveSession(String access, int expiresIn, String refresh, {required bool remember}) async {
+    await storage.writeAccess(access);
+    _learnClockSkew(access, expiresIn);
+    if (remember) {
+      _sessionRefresh = null;
+      await storage.writeRefresh(refresh);
+    } else {
+      _sessionRefresh = refresh;
+      await storage.writeRefresh(null);
+    }
+  }
+
+  /// El body como JSON; si no lo es, [InvalidResponseException].
+  Map<String, dynamic> _json(http.Response r) {
+    try {
+      final v = jsonDecode(r.body);
+      if (v is Map<String, dynamic>) return v;
+    } on FormatException {
+      // sigue abajo
+    }
+    throw InvalidResponseException('Respuesta inesperada del servidor', status: r.statusCode);
+  }
+
+  /// Arma un modelo con el body; si falta un campo o tiene otro tipo,
+  /// [InvalidResponseException] en vez de un `TypeError`.
+  T _parse<T>(http.Response r, T Function(Map<String, dynamic>) build) {
+    final m = _json(r);
+    try {
+      return build(m);
+    } on TypeError {
+      throw InvalidResponseException('Respuesta inesperada del servidor', status: r.statusCode);
+    } on FormatException {
+      throw InvalidResponseException('Respuesta inesperada del servidor', status: r.statusCode);
+    }
+  }
+
   Future<bool> _doRefresh() async {
-    final rt = await storage.readRefresh();
+    final rt = await _readRefresh();
     if (rt == null || rt.isEmpty) return false;
 
     // 0.3.0: pide rotar el refresh token. El backend devuelve uno nuevo y
@@ -200,13 +248,20 @@ class AuthClient {
 
     if (r.statusCode == 200) {
       AppLogger.info('Refresh OK');
-      final body = jsonDecode(r.body) as Map<String, dynamic>;
-      final t = TokensPartial.fromJson(body); // access_token + expires_in
+      final body = _json(r);
+      final t = _parse(r, (_) => TokensPartial.fromJson(body)); // access_token + expires_in
       await storage.writeAccess(t.accessToken);
       _learnClockSkew(t.accessToken, t.expiresIn);
-      // Viene el refresh token nuevo (rotación): se guarda.
+      // Viene el refresh token nuevo (rotación): se guarda donde estaba el
+      // anterior (memoria si la sesión es sin "recordarme").
       final newRt = body['refresh_token'];
-      if (newRt is String && newRt.isNotEmpty) await storage.writeRefresh(newRt);
+      if (newRt is String && newRt.isNotEmpty) {
+        if (_sessionRefresh != null) {
+          _sessionRefresh = newRt;
+        } else {
+          await storage.writeRefresh(newRt);
+        }
+      }
       return true;
     }
 
@@ -214,6 +269,7 @@ class AuthClient {
       // Refresh token vencido o revocado (logout, cambio de contraseña): la
       // sesión terminó. El backend responde `INVALID_TOKEN`; acá siempre se
       // trata del refresh token.
+      _sessionRefresh = null;
       await storage.clear();
       throw InvalidRefreshTokenException(_messageOf(r), status: 401);
     }
@@ -318,7 +374,7 @@ class AuthClient {
     });
 
     if (r.statusCode == 200 || r.statusCode == 201) {
-      return jsonDecode(r.body) as Map<String, dynamic>;
+      return _json(r);
     }
     _throwFor(r);
   }
@@ -357,7 +413,9 @@ class AuthClient {
   // =========================
   // Auth (login / social)
   // =========================
-  Future<Tokens> login(String email, String password, {bool remember = false}) async {
+  /// [remember]: por defecto `true`, como [socialLogin] (antes `false`). Sin
+  /// él, el refresh token queda solo en memoria.
+  Future<Tokens> login(String email, String password, {bool remember = true}) async {
     final r = await _plain.postJson(config.endpoint('login'), {
       'email': email,
       'password': password,
@@ -365,10 +423,8 @@ class AuthClient {
     });
 
     if (r.statusCode == 200) {
-      final t = Tokens.fromJson(jsonDecode(r.body) as Map<String, dynamic>);
-      await storage.writeAccess(t.accessToken);
-      _learnClockSkew(t.accessToken, t.expiresIn);
-      await storage.writeRefresh(t.refreshToken);
+      final t = _parse(r, Tokens.fromJson);
+      await _saveSession(t.accessToken, t.expiresIn, t.refreshToken, remember: remember);
       return t;
     }
     _throwFor(r);
@@ -382,10 +438,8 @@ class AuthClient {
     });
 
     if (r.statusCode == 200) {
-      final t = Tokens.fromJson(jsonDecode(r.body) as Map<String, dynamic>);
-      await storage.writeAccess(t.accessToken);
-      _learnClockSkew(t.accessToken, t.expiresIn);
-      await storage.writeRefresh(t.refreshToken);
+      final t = _parse(r, Tokens.fromJson);
+      await _saveSession(t.accessToken, t.expiresIn, t.refreshToken, remember: remember);
       return t;
     }
     _throwFor(r);
@@ -400,7 +454,7 @@ class AuthClient {
     }
     final r = await _authedGet(config.endpoint('me'));
     if (r.statusCode == 200) {
-      return jsonDecode(r.body) as Map<String, dynamic>;
+      return _json(r);
     }
     _throwFor(r);
   }
@@ -420,9 +474,8 @@ class AuthClient {
         final body = jsonDecode(r.body) as Map<String, dynamic>;
         if (body.containsKey('access_token') && body.containsKey('refresh_token')) {
           final t = Tokens.fromJson(body);
-          await storage.writeAccess(t.accessToken);
-          _learnClockSkew(t.accessToken, t.expiresIn);
-          await storage.writeRefresh(t.refreshToken);
+          await _saveSession(t.accessToken, t.expiresIn, t.refreshToken,
+              remember: _sessionRefresh == null);
         }
       } catch (_) {}
       return;
@@ -435,7 +488,8 @@ class AuthClient {
   // Logout
   // =========================
   Future<void> logout() async {
-    final rt = await storage.readRefresh();
+    final rt = await _readRefresh();
+    _sessionRefresh = null;
     if (rt != null && rt.isNotEmpty) {
       try {
         await _plain.postJson(config.endpoint('logout'), {'refresh_token': rt});

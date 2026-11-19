@@ -2,7 +2,7 @@
 
 SDK interno en Flutter/Dart para autenticar apps contra el backend de auth de GLOBA, que es un servicio REST en ORDS (por ejemplo `https://globa.space/ords/corpus/auth/`). Cubre el login con email y contraseña, el login social con Google y Apple, el manejo de tokens (access y refresh) y los endpoints de la cuenta.
 
-> Estado: versión `0.3.0`, `publish_to: none`, de uso interno. La estructura todavía es la de una **app** Flutter (`lib/main.dart` "Hello World" y carpetas de plataforma de template), no la de un package.
+> Estado: versión `0.4.0`, `publish_to: none`, de uso interno. Es un **package** Flutter (sin carpetas de plataforma ni `lib/main.dart` desde 0.4.0).
 
 ## Stack
 
@@ -25,11 +25,10 @@ lib/
     providers/
       google_adapter.dart       # Devuelve el id_token de Google
       apple_adapter.dart        # Devuelve el identityToken de Apple
-    widgets/                    # apple/google_signin_button.dart (archivos vacíos)
   util/logger.dart              # AppLogger (debugPrint con colores, solo en debug)
 test/
   config_test.dart              # AuthConfig.endpoint / ?lang=
-  auth_client_test.dart         # refresh, ensureSession, Bearer, solo https (con MockClient)
+  auth_client_test.dart         # refresh, ensureSession, remember, formato, Bearer, reloj, https (con MockClient)
 ```
 
 ## Uso básico
@@ -80,6 +79,11 @@ Los JSON van en **snake_case**: `access_token`, `refresh_token`, `token_type`, `
 ## Manejo de sesión
 
 - Las claves en el storage son `jwt` (access token) y `refresh` (refresh token).
+- **`SecureStorage`:**
+  - **Android:** las opciones por defecto de `flutter_secure_storage` 9, que cifran con una clave AES envuelta por una RSA del Android Keystore. No usa `encryptedSharedPreferences`, porque Jetpack Security está deprecado y el plugin trasladaría lo guardado a otro archivo.
+  - **iOS:** `first_unlock_this_device`, desde 0.4.0.
+  - **El Keychain de iOS sobrevive a la desinstalación:** la app tiene que llamar a `clear()` la primera vez que se abre después de instalarla. Corpus lo hace desde IA-085.
+- **`remember`** (por defecto `true` en `login` y `socialLogin` desde 0.4.0): sin él, el refresh token queda **solo en memoria**, rota ahí, y la sesión termina con el proceso. Antes se guardaba igual en el dispositivo.
 - `ensureSession()`:
   - sin access token → refresh;
   - access token vencido (`exp - accessLeeway`) → refresh obligatorio;
@@ -115,6 +119,7 @@ El cliente traduce la respuesta HTTP a una subclase de `AuthException`, que es u
 | 429 | * | `RateLimitedException` |
 | 500 | * | `ServerErrorException` |
 | red o timeout (20 s) | `NETWORK` | `NetworkException` |
+| 200 con un body sin el formato esperado | `INVALID_RESPONSE` | `InvalidResponseException` (0.4.0; antes `TypeError`) |
 | otro | * | `UnknownAuthException` |
 
 Desde IA-079 de Corpus (2026-11-18), el body de error trae `code`, `error`, `request_id` y `timestamp`, y a veces `details.context`. Ya **no** trae `details.sqlerrm`: el detalle de los 500 queda en la base (`CRP_ERROR_LOG`), buscable por `request_id`.
@@ -128,6 +133,13 @@ Desde IA-079 de Corpus (2026-11-18), el body de error trae `code`, `error`, `req
 ## Problemas conocidos / pendientes de seguridad
 
 Surgieron de una revisión de seguridad del 2026-11-18.
+
+**Arreglado en 0.4.0** (IA-085 de Corpus):
+- **`remember: false`:** el refresh token ya no se guarda en el dispositivo, y `login` y `socialLogin` usan el mismo default.
+- **iOS:** Keychain con `first_unlock_this_device`. Android sigue con el cifrado del Keystore (ver "Manejo de sesión").
+- **Formato de las respuestas:** `InvalidResponseException` en vez de `TypeError`.
+- **Repo de package:** sin las carpetas de plataforma de template (que además firmaban el release con debug keys), sin `lib/main.dart` ni widgets vacíos, y con README.
+- **Analizador sin avisos.**
 
 **Arreglado en 0.3.0** (IA-083 de Corpus): el SDK pide la rotación del refresh token.
 
@@ -146,17 +158,8 @@ Surgieron de una revisión de seguridad del 2026-11-18.
   - `test()` borrado.
 
 **Pendiente:**
-1. **`remember: false` igual guarda el refresh token** en el dispositivo (el backend lo hace durar 1 día en vez de 30). Además el default no es coherente: `login` usa `false` y `socialLogin`, `true`. Cambiarlo es una decisión de producto: sin "recordarme", la sesión no sobreviviría a cerrar la app.
-2. **No hay `nonce`** en Sign in with Apple ni en Google, lo que permite el replay de un `id_token`. Hace falta un cambio coordinado con el backend.
-3. **`FlutterSecureStorage` está con los defaults:** falta `encryptedSharedPreferences` en Android y `first_unlock_this_device` en iOS.
-   - Ojo: activar `encryptedSharedPreferences` deja sin acceso a lo guardado antes, así que cierra la sesión de todos una vez.
-   - Corpus ya tiene `allowBackup="false"`.
-   - El Keychain sobrevive a la desinstalación.
-4. **Web:** los tokens quedan en `localStorage`, expuestos a XSS. En web conviene una cookie `HttpOnly` para el refresh token.
-5. **Higiene:**
-   - `fromJson` puede lanzar `TypeError` si el backend cambia el formato;
-   - las carpetas de plataforma son de template y el release se firma con debug keys;
-   - la estructura sigue siendo la de una app, no la de un package.
+1. **No hay `nonce`** en el login con Google: se puede reusar un `id_token` interceptado. Va en IA-086, junto con el backend. El de Apple, con Sign in with Apple (IA-087, cuando se publique en iOS).
+2. **Web:** en web, `flutter_secure_storage` guarda en `localStorage`, expuesto a XSS. Ahí convendría una cookie `HttpOnly` para el refresh token. Hoy no aplica: Corpus no tiene versión web.
 
 ## Backend de auth (revisado el 2026-11-18)
 El backend está en el repo de Corpus (`corpus_mobile_app`):
